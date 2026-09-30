@@ -20,57 +20,85 @@ class VideoWallpaperService : WallpaperService() {
 
         private var loopStartMs = 0
         private var loopEndMs = 0
+        private var introDone = false   // true once we have reached the loop part
+        private var pausedByUs = false  // true only when WE paused it (screen hidden)
+        private var resumeMs = 0        // where to carry on after Android rebuilds the surface
 
         private val videoFile get() = File(filesDir, MainActivity.VIDEO_FILE)
         private val prefs get() = getSharedPreferences("prefs", Context.MODE_PRIVATE)
 
-        // Checks the video position every 40 ms. When it passes the loop END,
-        // jump back to the loop START.
+        // Watchdog: runs all the time. While the wallpaper is visible it
+        //  1) jumps back to the loop start when the loop end is reached
+        //  2) restarts playback if the video stopped for any reason
         private val ticker = object : Runnable {
             override fun run() {
-                val p = player ?: return
-                try {
-                    if (p.isPlaying && p.currentPosition >= loopEndMs) {
-                        seekToMs(p, loopStartMs)
+                val p = player
+                if (p != null) {
+                    try {
+                        val pos = p.currentPosition
+                        if (pos >= loopStartMs) introDone = true
+                        if (p.isPlaying) {
+                            if (pos >= loopEndMs) seekToMs(p, loopStartMs)
+                        } else if (!pausedByUs) {
+                            // stopped by itself (stall / finished) -> resume in the loop
+                            if (introDone) seekToMs(p, loopStartMs)
+                            p.start()
+                        }
+                    } catch (e: Exception) {
+                        restartPlayer()
                     }
-                } catch (_: Exception) {}
-                handler.postDelayed(this, 40)
+                }
+                handler.postDelayed(this, if (pausedByUs) 500L else 50L)
             }
         }
 
         override fun onSurfaceCreated(holder: SurfaceHolder) {
             super.onSurfaceCreated(holder)
             this.holder = holder
-            startPlayer()
+            pausedByUs = false
+            startPlayer(resumeMs)
+            handler.removeCallbacks(ticker)
+            handler.post(ticker)
         }
 
         override fun onVisibilityChanged(visible: Boolean) {
             val p = player ?: return
             try {
                 if (visible) {
-                    if (prefs.getBoolean("replay_intro", false)) seekToMs(p, 0)
+                    pausedByUs = false
+                    if (prefs.getBoolean("replay_intro", false)) {
+                        introDone = false
+                        seekToMs(p, 0)
+                    }
                     p.start()
-                    handler.removeCallbacks(ticker)
-                    handler.post(ticker)
                 } else {
+                    pausedByUs = true
                     p.pause()
-                    handler.removeCallbacks(ticker)
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                restartPlayer()
+            }
         }
 
         override fun onSurfaceDestroyed(holder: SurfaceHolder) {
+            handler.removeCallbacks(ticker)
+            try { player?.let { resumeMs = it.currentPosition } } catch (_: Exception) {}
             releasePlayer()
             this.holder = null
             super.onSurfaceDestroyed(holder)
         }
 
         override fun onDestroy() {
+            handler.removeCallbacks(ticker)
             releasePlayer()
             super.onDestroy()
         }
 
-        private fun startPlayer() {
+        private fun restartPlayer() {
+            startPlayer(if (introDone) loopStartMs else 0)
+        }
+
+        private fun startPlayer(startAtMs: Int) {
             val h = holder ?: return
             if (!videoFile.exists()) return
             releasePlayer()
@@ -83,7 +111,6 @@ class VideoWallpaperService : WallpaperService() {
                 p.setVideoScalingMode(MediaPlayer.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING)
                 p.prepare()
 
-                // Read the times the user chose, and keep them safe.
                 val dur = p.duration
                 var start = prefs.getLong("loop_start_ms", 0L).toInt()
                 var end = prefs.getLong("loop_end_ms", 0L).toInt()
@@ -92,16 +119,26 @@ class VideoWallpaperService : WallpaperService() {
                 loopStartMs = start
                 loopEndMs = end
 
-                // If the video reaches its very end, go back to loop start.
+                // Video reached its very end -> go back to the loop start
                 p.setOnCompletionListener {
-                    seekToMs(it, loopStartMs)
-                    it.start()
+                    try {
+                        introDone = true
+                        seekToMs(it, loopStartMs)
+                        it.start()
+                    } catch (e: Exception) {
+                        handler.post { restartPlayer() }
+                    }
                 }
-                p.setOnErrorListener { _, _, _ -> true }
+                // Any error -> rebuild the player instead of dying silently
+                p.setOnErrorListener { _, _, _ ->
+                    handler.post { restartPlayer() }
+                    true
+                }
 
-                p.start() // begins at 0:00 -> this is the "play once" part
+                val target = if (startAtMs >= end) start else startAtMs
+                if (target > 0) seekToMs(p, target)
+                p.start()
                 player = p
-                handler.post(ticker)
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -116,10 +153,10 @@ class VideoWallpaperService : WallpaperService() {
         }
 
         private fun releasePlayer() {
-            handler.removeCallbacks(ticker)
             player?.apply {
+                try { setOnCompletionListener(null); setOnErrorListener(null) } catch (_: Exception) {}
                 try { stop() } catch (_: Exception) {}
-                release()
+                try { release() } catch (_: Exception) {}
             }
             player = null
         }

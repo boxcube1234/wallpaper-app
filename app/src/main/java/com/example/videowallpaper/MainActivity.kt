@@ -77,7 +77,7 @@ class MainActivity : Activity() {
         root.addView(endBox)
 
         root.addView(Switch(this).apply {
-            text = "Replay intro every time I unlock"
+            text = "Replay intro whenever I return to the home screen"
             isChecked = prefs.getBoolean("replay_intro", false)
             setPadding(0, pad, 0, pad)
             setOnCheckedChangeListener { _, on ->
